@@ -252,6 +252,16 @@ esp_err_t mqtt_fetch_retained(mqtt_job_t *job, const char *heartbeat_json)
         ctx.events, BIT_GOT_MSG | BIT_FAILED,
         pdFALSE, pdFALSE, pdMS_TO_TICKS(MQTT_WAIT_MS));
 
+    /* esp_mqtt_client_stop() drops pending events, so if the broker
+     * delivers `frame/bin` before `config` (typical -- the URL is the
+     * shorter payload) the config update gets discarded by the
+     * teardown. Give it a brief settle window after BIT_GOT_MSG fires
+     * so any other retained payloads (today: config; tomorrow:
+     * whatever else we subscribe to) make it through apply_*. */
+    if (bits & BIT_GOT_MSG) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
     esp_mqtt_client_stop(cli);
     esp_mqtt_client_destroy(cli);
     vEventGroupDelete(ctx.events);
