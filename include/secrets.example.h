@@ -27,7 +27,7 @@
 //
 // device_id is the topic-namespace prefix: tesserae/<device_id>/{frame/bin,
 // config,status}. Defaults to "photopainter-73" so the 7.3" panel doesn't
-// collide with the 13.3" client ("esp32") on a shared broker.
+// collide with the 13.3" client (esp32) on a shared broker.
 // #define MQTT_DEFAULT_DEVICE_ID    "photopainter-73"
 //
 // #define MQTT_CLIENT_ID            "tesserae-photopainter-73-1"  /* unique per device on the broker */

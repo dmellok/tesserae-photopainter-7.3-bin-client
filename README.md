@@ -94,6 +94,24 @@ No tests -- smoke-test on real hardware. Recommended validation after any change
 2. `mosquitto_pub -t tesserae/photopainter-73/frame/bin -r -m '{"url":"http://.../test.bin"}'` and confirm the panel paints.
 3. Hold BOOT, press RESET, confirm `http://tesserae-photopainter-73.local/` (or the device IP) serves the settings form pre-filled with live values.
 
+## Release process
+
+[`tools/release.sh`](tools/release.sh) cuts a leak-safe GitHub release for the version in `platformio.ini`. **Do not** `pio run` straight into `gh release create` — `include/secrets.h` is `#include`d at compile time and its `#define` values land in `.rodata`. A 3-second `strings firmware.bin | grep` would walk away with your WiFi password, MQTT credentials, and broker URI.
+
+The script defends in two layers, both required:
+
+1. **Move-aside with restore trap.** Before building, `include/secrets.h` is renamed to a unique `.secrets.h.release-backup.<pid>` sibling and an `EXIT` trap is installed to restore it. The build then sees no `secrets.h`, the `__has_include` guard in `include/app_config.h` skips the include, and `WIFI_DEFAULT_*` / `MQTT_DEFAULT_*` all fall back to `""`.
+2. **Post-build leak scan.** Every quoted string literal of ≥ 4 chars is parsed out of the stashed backup and grep'd against each built `.bin`. Any match aborts the release with a `LEAK:` line naming the value. This is the actual safety net — layer 1 is cheap prevention.
+
+```bash
+tools/release.sh                 # build, scan, tag, release
+tools/release.sh --notes-only    # print suggested release notes and exit
+```
+
+The script refuses to run on a dirty tree or when `origin/main` is ahead of `HEAD`. Release artifacts are staged to `release/<version>/` (gitignored) and uploaded as GitHub release assets alongside a `SHA256SUMS` file.
+
+If you change `tools/release.sh`, validate it by temporarily commenting out the `mv "$SECRETS" "$BAK"` line and re-running — the leak scan must catch the leak and abort with a `LEAK:` line before the upload step. Restore the `mv` after the test.
+
 ## Credits
 
 The wake state machine, captive-portal provisioning, NVS schema, and MQTT contract are forked verbatim from [`dmellok/tesserae-esp32-bin-client`](https://github.com/dmellok/tesserae-esp32-bin-client) (the 13.3" Spectra E6 sibling).
