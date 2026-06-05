@@ -28,6 +28,19 @@ static httpd_handle_t s_httpd = NULL;
 static esp_netif_t *s_ap_netif = NULL;
 static bool s_mdns_up = false;
 
+/* Pre-scan cache: filled once at portal start (in STA mode, before the AP
+ * comes up) and rendered into the form's <select> so the user can click a
+ * nearby SSID instead of typing. Bounded; scans rarely turn up more than a
+ * handful of unique networks in a residential context. */
+#define SCAN_MAX 12
+typedef struct {
+    char    ssid[33];
+    int8_t  rssi;
+    bool    secure;
+} scan_entry_t;
+static scan_entry_t s_scan[SCAN_MAX];
+static int          s_scan_count = 0;
+
 /* ---------- minimal wildcard DNS hijack ----------
  *
  * Listens on UDP/53 and answers every A query with our AP IP (192.168.4.1).
@@ -85,54 +98,161 @@ static void dns_hijack_task(void *arg)
     }
 }
 
-/* ---------- HTML ---------- */
-
+/* ---------- HTML ----------
+ *
+ * Inline CSS uses Tesserae's design tokens (accent #0d8c7e, surface #f1f0ec,
+ * etc., from dmellok/tesserae). We can't reach out to fetch CSS files in the
+ * captive portal so everything ships inline -- ~3 KB total page weight,
+ * chunked-sent to keep stack usage modest.
+ */
 static const char k_head[] =
-"<!doctype html><html><head><meta charset=\"utf-8\">"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">"
 "<title>Tesserae Setup</title>"
 "<style>"
-"body{font-family:system-ui,sans-serif;max-width:420px;margin:1.5em auto;padding:0 1em;color:#222}"
-"h1{font-size:1.3em}h2{font-size:1.05em;margin:1.8em 0 .2em;color:#555}"
-"label{display:block;margin:.9em 0 .3em;font-size:.95em}"
-"input{width:100%;padding:.6em;font-size:1em;box-sizing:border-box}"
-"small{display:block;color:#888;margin-top:.25em;font-size:.8em}"
-"code{background:#f2f2f2;padding:.05em .3em;border-radius:3px}"
-".err{color:#b00020;font-weight:600}"
-"button{margin-top:1.5em;padding:.7em 1.2em;font-size:1em;width:100%}"
-"</style></head><body>"
-"<h1>Tesserae Setup</h1>";
+":root{--bg:#f1f0ec;--surface:#fff;--fg:#18181b;--muted:#71706c;"
+"--accent:#0d8c7e;--accent-hover:#0a6f63;--accent-soft:#e6f3f1;"
+"--border:#e6e5e1;--radius:10px}"
+"*{box-sizing:border-box}"
+"body{margin:0;padding:24px 16px env(safe-area-inset-bottom);"
+"font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Inter,system-ui,sans-serif;"
+"font-size:15px;background:var(--bg);color:var(--fg);line-height:1.45;"
+"-webkit-text-size-adjust:100%;-webkit-font-smoothing:antialiased}"
+"main{max-width:480px;margin:0 auto}"
+".brand{display:flex;align-items:center;gap:10px;margin:0 0 6px;"
+"font-weight:700;font-size:20px;letter-spacing:-0.015em}"
+".brand-mark{width:32px;height:32px;border-radius:8px;"
+"background:linear-gradient(135deg,var(--accent),var(--accent-hover));"
+"box-shadow:inset 0 1px 0 rgba(255,255,255,.35),"
+"0 1px 3px rgba(13,140,126,.35),0 6px 16px rgba(13,140,126,.18)}"
+".tag{color:var(--muted);font-size:13px;margin:0 0 18px}"
+".card{background:var(--surface);border:1px solid var(--border);"
+"border-radius:var(--radius);padding:18px 16px;margin-bottom:14px}"
+".card h2{margin:0 0 14px;font-size:11px;text-transform:uppercase;"
+"letter-spacing:0.08em;color:var(--muted);font-weight:600}"
+".status{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;"
+"font-size:13px;color:var(--muted);margin-bottom:14px;padding:14px 16px;"
+"background:var(--surface);border:1px solid var(--border);"
+"border-radius:var(--radius)}"
+".status .k{font-weight:600;color:var(--fg)}"
+".status code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+"font-size:12px;background:#fafaf9;padding:1px 6px;border-radius:4px;border:1px solid var(--border)}"
+".field{margin-bottom:14px}"
+".field:last-child{margin-bottom:0}"
+"label{display:block;font-weight:500;font-size:13px;margin-bottom:6px;color:var(--fg)}"
+"input,select{width:100%;padding:10px 12px;border:1px solid var(--border);"
+"border-radius:6px;background:var(--surface);font:inherit;font-size:15px;"
+"color:var(--fg);-webkit-appearance:none;appearance:none;"
+"transition:border-color .12s,box-shadow .12s}"
+"input:focus,select:focus{outline:none;border-color:var(--accent);"
+"box-shadow:0 0 0 3px rgba(13,140,126,.18)}"
+"select{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),"
+"linear-gradient(135deg,var(--muted) 50%,transparent 50%);"
+"background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;"
+"background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:28px;cursor:pointer}"
+".pw{position:relative}"
+".pw input{padding-right:64px}"
+".pw button{position:absolute;right:4px;top:50%;transform:translateY(-50%);"
+"background:none;border:0;color:var(--accent);font:inherit;font-size:13px;"
+"font-weight:600;padding:8px 10px;cursor:pointer;border-radius:4px}"
+".pw button:hover{background:var(--accent-soft)}"
+".hint{margin-top:6px;font-size:12px;color:var(--muted)}"
+".hint code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+"background:#fafaf9;padding:1px 5px;border-radius:3px;border:1px solid var(--border);font-size:11px}"
+".err{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;"
+"padding:12px 14px;border-radius:var(--radius);margin-bottom:14px;font-size:14px}"
+"button.submit{width:100%;padding:12px 16px;border:0;border-radius:8px;"
+"background:var(--accent);color:#fff;font:inherit;font-size:15px;"
+"font-weight:600;cursor:pointer;margin-top:4px;"
+"transition:background .12s}"
+"button.submit:hover{background:var(--accent-hover)}"
+"button.submit:active{transform:translateY(1px)}"
+"</style></head><body><main>"
+"<div class=\"brand\"><span class=\"brand-mark\"></span><span>Tesserae</span></div>"
+"<p class=\"tag\">Device setup</p>";
 
-/* %s x4: ssid, mqtt_uri, device_id, mqtt_user (all pre-escaped) */
-static const char k_form_fmt[] =
+/* WiFi card; %s x2 = (ssid prefill, scan-picker HTML or empty) */
+static const char k_form_wifi_fmt[] =
 "<form method=\"POST\" action=\"/save\">"
-"<h2>WiFi</h2>"
-"<label>Network name (SSID) *</label>"
-"<input name=\"ssid\" required maxlength=\"32\" autocomplete=\"off\" value=\"%s\">"
-"<label>Password</label>"
-"<input name=\"pass\" type=\"password\" maxlength=\"64\" autocomplete=\"off\">"
-"<small>Leave blank to keep the current password.</small>"
-"<h2>MQTT broker</h2>"
-"<label>Broker URI *</label>"
-"<input name=\"mqtt_uri\" required maxlength=\"159\" autocomplete=\"off\" value=\"%s\" "
-"placeholder=\"mqtt://192.168.1.50:1883\">"
-"<small>Use <code>mqtts://</code> for TLS; scheme is added if you omit it.</small>"
-"<label>Device id</label>"
-"<input name=\"device_id\" maxlength=\"32\" pattern=\"[a-z][a-z0-9_-]{1,31}\" "
-"autocomplete=\"off\" value=\"%s\" placeholder=\"esp32\">"
-"<small>Topics: <code>tesserae/&lt;id&gt;/frame/bin</code> etc. Default "
-"<code>esp32</code> matches the built-in Tesserae kind.</small>"
-"<label>Username (optional)</label>"
-"<input name=\"mqtt_user\" maxlength=\"63\" autocomplete=\"off\" value=\"%s\">"
-"<label>Password (optional)</label>"
-"<input name=\"mqtt_pass\" type=\"password\" maxlength=\"63\" autocomplete=\"off\">"
-"<small>Leave blank to keep the current password.</small>"
-"<button type=\"submit\">Save &amp; restart</button>"
-"</form></body></html>";
+"<section class=\"card\"><h2>WiFi network</h2>"
+"<div class=\"field\">"
+"<label for=\"ssid\">Network name (SSID) *</label>"
+"<input id=\"ssid\" name=\"ssid\" required maxlength=\"32\" "
+"autocomplete=\"off\" value=\"%s\" placeholder=\"my-home-wifi\">"
+"</div>"
+"%s"
+"<div class=\"field pw\">"
+"<label for=\"wifi-pw\">Password</label>"
+"<input id=\"wifi-pw\" name=\"pass\" type=\"password\" maxlength=\"64\" autocomplete=\"off\">"
+"<button type=\"button\" data-toggle=\"wifi-pw\" aria-label=\"Show password\">Show</button>"
+"<p class=\"hint\">Leave blank to keep the current password.</p>"
+"</div>"
+"</section>";
+
+/* MQTT card; %s x3 = (mqtt_uri, device_id, mqtt_user) */
+static const char k_form_mqtt_fmt[] =
+"<section class=\"card\"><h2>MQTT broker</h2>"
+"<div class=\"field\">"
+"<label for=\"mqtt_uri\">Broker URI *</label>"
+"<input id=\"mqtt_uri\" name=\"mqtt_uri\" required maxlength=\"159\" "
+"autocomplete=\"off\" value=\"%s\" placeholder=\"mqtt://192.168.1.50:1883\">"
+"<p class=\"hint\">Use <code>mqtts://</code> for TLS; scheme is added if omitted.</p>"
+"</div>"
+"<div class=\"field\">"
+"<label for=\"device_id\">Device id</label>"
+"<input id=\"device_id\" name=\"device_id\" maxlength=\"32\" "
+"pattern=\"[a-z][a-z0-9_-]{1,31}\" autocomplete=\"off\" "
+"value=\"%s\" placeholder=\"esp32\">"
+"<p class=\"hint\">Topics: <code>tesserae/&lt;id&gt;/frame/bin</code> etc. "
+"Default <code>esp32</code> matches the built-in Tesserae kind.</p>"
+"</div>"
+"<div class=\"field\">"
+"<label for=\"mqtt_user\">Username <span style=\"color:var(--muted);font-weight:400\">(optional)</span></label>"
+"<input id=\"mqtt_user\" name=\"mqtt_user\" maxlength=\"63\" autocomplete=\"off\" value=\"%s\">"
+"</div>"
+"<div class=\"field pw\">"
+"<label for=\"mqtt-pw\">Password <span style=\"color:var(--muted);font-weight:400\">(optional)</span></label>"
+"<input id=\"mqtt-pw\" name=\"mqtt_pass\" type=\"password\" maxlength=\"63\" autocomplete=\"off\">"
+"<button type=\"button\" data-toggle=\"mqtt-pw\" aria-label=\"Show password\">Show</button>"
+"<p class=\"hint\">Leave blank to keep the current password.</p>"
+"</div>"
+"</section>"
+"<button class=\"submit\" type=\"submit\">Save &amp; restart</button>"
+"</form>";
+
+/* JS at end: password show/hide + scan-picker click-to-fill. Inline, no
+ * dependencies; runs after the DOM is parsed since it's at the bottom. */
+static const char k_tail[] =
+"<script>"
+"document.querySelectorAll('[data-toggle]').forEach(b=>{"
+"b.addEventListener('click',()=>{"
+"const i=document.getElementById(b.dataset.toggle);"
+"const s=i.type==='password';"
+"i.type=s?'text':'password';"
+"b.textContent=s?'Hide':'Show';"
+"});"
+"});"
+"const pick=document.getElementById('ssid-pick');"
+"if(pick){pick.addEventListener('change',e=>{"
+"if(e.target.value){document.getElementById('ssid').value=e.target.value;"
+"document.getElementById('wifi-pw').focus();}"
+"});}"
+"</script></main></body></html>";
 
 static const char k_thanks_html[] =
-"<!doctype html><html><body style=\"font-family:system-ui;text-align:center;margin:3em\">"
-"<h2>Saved.</h2><p>Tesserae will reboot and apply the new settings now.</p>"
+"<!doctype html><html><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>Saved</title>"
+"<style>"
+"body{margin:0;padding:40px 16px;background:#f1f0ec;color:#18181b;"
+"font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;text-align:center}"
+".card{max-width:380px;margin:0 auto;background:#fff;border:1px solid #e6e5e1;"
+"border-radius:10px;padding:28px 20px}"
+"h1{margin:0 0 8px;font-size:20px;color:#0d8c7e}"
+"p{margin:0;color:#71706c;font-size:14px;line-height:1.5}"
+"</style></head><body>"
+"<div class=\"card\"><h1>Saved</h1>"
+"<p>Tesserae will reboot and apply the new settings now.</p></div>"
 "</body></html>";
 
 /* Escape &, <, >, " for safe interpolation into HTML attribute values. */
@@ -220,22 +340,59 @@ static esp_err_t render_form(httpd_req_t *req, const char *error)
     httpd_resp_sendstr_chunk(req, k_head);
 
     if (error && *error) {
-        httpd_resp_sendstr_chunk(req, "<p class=\"err\">");
+        httpd_resp_sendstr_chunk(req, "<div class=\"err\">");
         httpd_resp_sendstr_chunk(req, error);   /* our own constant strings, safe */
-        httpd_resp_sendstr_chunk(req, "</p>");
+        httpd_resp_sendstr_chunk(req, "</div>");
     }
 
-    char status[320];
+    /* Status strip: device id + broker + STA IP (or "setup AP" when the
+     * captive portal is up and the device has no STA association yet). */
+    char status[512];
     snprintf(status, sizeof status,
-        "<h2>Status</h2><p>Device id <code>%s</code><br>"
-        "MQTT <code>%s</code><br>IP <code>%s</code></p>",
+        "<div class=\"status\">"
+        "<span class=\"k\">Device id</span><span><code>%s</code></span>"
+        "<span class=\"k\">Broker</span><span><code>%s</code></span>"
+        "<span class=\"k\">IP</span><span><code>%s</code></span>"
+        "</div>",
         e_devid, e_uri, have_ip ? ip : "(setup AP)");
     httpd_resp_sendstr_chunk(req, status);
 
-    char form[1200];
-    snprintf(form, sizeof form, k_form_fmt, e_ssid, e_uri, e_devid, e_user);
-    httpd_resp_sendstr_chunk(req, form);
+    /* Build the scan-picker <select> block from the cached scan results.
+     * Empty string if the scan turned up nothing -- the form still renders
+     * with the bare SSID input. */
+    char picker[1024] = "";
+    if (s_scan_count > 0) {
+        size_t o = (size_t)snprintf(picker, sizeof picker,
+            "<div class=\"field\">"
+            "<label for=\"ssid-pick\">Or pick a nearby network</label>"
+            "<select id=\"ssid-pick\" autocomplete=\"off\">"
+            "<option value=\"\">-- pick a network --</option>");
+        for (int i = 0; i < s_scan_count && o + 128 < sizeof picker; i++) {
+            char esc[96];
+            html_escape(s_scan[i].ssid, esc, sizeof esc);
+            int n = snprintf(picker + o, sizeof picker - o,
+                "<option value=\"%s\">%s (%d dBm%s)</option>",
+                esc, esc, s_scan[i].rssi, s_scan[i].secure ? "" : ", open");
+            if (n < 0 || (size_t)n >= sizeof picker - o) break;
+            o += (size_t)n;
+        }
+        if (o + 16 < sizeof picker) {
+            snprintf(picker + o, sizeof picker - o, "</select></div>");
+        }
+    }
 
+    /* form_wifi must hold: ~580 bytes of literal HTML + escaped ssid + picker
+     * (up to ~1 KB). 2048 leaves headroom. form_mqtt needs to hold literal +
+     * three escaped values; 1800 covers worst case. */
+    char form_wifi[2048];
+    snprintf(form_wifi, sizeof form_wifi, k_form_wifi_fmt, e_ssid, picker);
+    httpd_resp_sendstr_chunk(req, form_wifi);
+
+    char form_mqtt[1800];
+    snprintf(form_mqtt, sizeof form_mqtt, k_form_mqtt_fmt, e_uri, e_devid, e_user);
+    httpd_resp_sendstr_chunk(req, form_mqtt);
+
+    httpd_resp_sendstr_chunk(req, k_tail);
     httpd_resp_sendstr_chunk(req, NULL);   /* terminate chunked response */
     return ESP_OK;
 }
@@ -308,6 +465,57 @@ static esp_err_t h_catchall(httpd_req_t *req)
 
 /* ---------- lifecycle helpers ---------- */
 
+/* Pre-AP scan: bring up STA briefly to populate s_scan[], then stop so
+ * start_ap() can take over the radio. Failures are non-fatal -- the form
+ * still works, just without the picker. */
+static void do_wifi_scan(void)
+{
+    /* The STA netif may not exist yet (provisioning is usually called before
+     * any STA connect attempt). Create it if missing -- harmless if it does. */
+    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
+        esp_netif_create_default_wifi_sta();
+    }
+
+    s_scan_count = 0;
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "scan set_mode: %s", esp_err_to_name(err)); return; }
+    err = esp_wifi_start();
+    if (err != ESP_OK) { ESP_LOGW(TAG, "scan wifi_start: %s", esp_err_to_name(err)); return; }
+
+    wifi_scan_config_t cfg = {0};
+    err = esp_wifi_scan_start(&cfg, /* block */ true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan_start: %s", esp_err_to_name(err));
+        esp_wifi_stop();
+        return;
+    }
+
+    uint16_t n = SCAN_MAX;
+    wifi_ap_record_t records[SCAN_MAX];
+    esp_wifi_scan_get_ap_records(&n, records);
+
+    for (int i = 0; i < (int)n && s_scan_count < SCAN_MAX; i++) {
+        const char *ssid = (const char *)records[i].ssid;
+        if (!ssid[0]) continue;   /* skip hidden */
+        /* Dedupe: same SSID on multiple APs (mesh / band-steering) collapses
+         * to the strongest seen entry, since esp_wifi orders by RSSI desc. */
+        bool dup = false;
+        for (int j = 0; j < s_scan_count; j++) {
+            if (strcmp(s_scan[j].ssid, ssid) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        strncpy(s_scan[s_scan_count].ssid, ssid, 32);
+        s_scan[s_scan_count].ssid[32] = '\0';
+        s_scan[s_scan_count].rssi = records[i].rssi;
+        s_scan[s_scan_count].secure = (records[i].authmode != WIFI_AUTH_OPEN);
+        s_scan_count++;
+    }
+    ESP_LOGI(TAG, "scan: %d unique nearby networks", s_scan_count);
+
+    esp_wifi_stop();
+}
+
 static void start_ap(void)
 {
     if (!s_ap_netif) s_ap_netif = esp_netif_create_default_wifi_ap();
@@ -336,7 +544,12 @@ static void start_http(bool captive)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.max_uri_handlers = 6;
-    cfg.stack_size = 8192;   /* render_form interpolates into ~2 KB of locals */
+    /* render_form holds ~5.5 KB of locals at once (status, picker, two form
+     * snprintf buffers, four escape buffers); plus snprintf/httpd internals
+     * and IDF framework overhead the task wants ~14 KB to stay safe.
+     * Anything tighter trips "stack overflow in task httpd" when a captive
+     * portal request comes in. */
+    cfg.stack_size = 16384;
 
     ESP_ERROR_CHECK(httpd_start(&s_httpd, &cfg));
 
@@ -375,6 +588,11 @@ static void stop_mdns(void)
 esp_err_t provisioning_run_blocking(void)
 {
     s_done = xEventGroupCreate();
+
+    /* Quick STA scan first so the form can offer a click-to-fill picker of
+     * nearby networks; runs only on the captive-portal path (not the
+     * always-on settings editor, where we're already STA-associated). */
+    do_wifi_scan();
 
     start_ap();
     start_http(/* captive */ true);

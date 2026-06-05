@@ -9,10 +9,14 @@ idf_component_register(
         "mqtt_handler.c"
         "pmic.c"
         "provisioning.c"
+        "splash.c"
         "wifi_manager.c"
     INCLUDE_DIRS
         "."
         "../include"
+    EMBED_FILES
+        "../assets/splash_logo.bin"
+        "../assets/splash_portal.bin"
     REQUIRES
         driver
         esp_driver_i2c

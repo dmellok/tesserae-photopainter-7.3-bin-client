@@ -48,6 +48,7 @@
 #include "mqtt_handler.h"
 #include "pmic.h"
 #include "provisioning.h"
+#include "splash.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "main";
@@ -220,7 +221,11 @@ static void sleep_forever_or_until_timer(void) {
 /* ---------- app ---------- */
 
 static void run_provisioning_then_reboot(void) {
-    ESP_LOGW(TAG, "no usable wifi creds; starting captive portal");
+    ESP_LOGW(TAG, "no usable wifi creds; painting portal splash + captive portal");
+    /* Paint logo + WPA QR before bringing up the AP so the user can scan
+     * to join Tesserae-Setup instead of typing the SSID. ~30 s panel
+     * refresh runs concurrently with the AP/HTTPD/DNS bringup. */
+    splash_show_portal();
     esp_err_t err = provisioning_run_blocking();
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "creds saved; rebooting to use them");
@@ -231,21 +236,23 @@ static void run_provisioning_then_reboot(void) {
     esp_restart();
 }
 
-/* Show the splash on a true cold boot -- power-on or RESET button. Skip
- * it on timer-wake (production sleep cycle) AND on software restart
- * (DEV_DISABLE_SLEEP loop iterations), so we don't burn 25 s of panel
- * refresh on every quick test cycle. */
-static void maybe_show_splash(esp_reset_reason_t reset_reason) {
+/* Show the Tesserae logo splash on a true cold boot (power-on / RESET).
+ * Skip it on timer-wake (production sleep cycle) AND on software restart
+ * (DEV_DISABLE_SLEEP / DEV_FORCE_SLEEP loop iterations) so we don't burn
+ * 25 s of panel refresh on every quick test cycle.
+ *
+ * If we'll be going straight to the captive portal anyway (no creds),
+ * skip the logo splash -- run_provisioning_then_reboot() paints the
+ * portal splash instead, avoiding a wasted second ~30 s refresh. */
+static void maybe_show_splash(esp_reset_reason_t reset_reason, bool has_creds) {
     if (reset_reason != ESP_RST_POWERON && reset_reason != ESP_RST_EXT) {
         return;
     }
-    ESP_LOGI(TAG, "cold boot; showing splash");
-    if (epd_port_init() != ESP_OK) {
-        ESP_LOGW(TAG, "panel init failed; skipping splash");
+    if (!has_creds) {
         return;
     }
-    epd_show_color_bars();
-    epd_sleep();
+    ESP_LOGI(TAG, "cold boot; showing logo splash");
+    splash_show_logo();
 }
 
 void app_main(void) {
@@ -268,12 +275,14 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(wifi_manager_init());
 
-    /* Cold-boot splash: a long-press during cold boot still wins later;
-     * a tap before the splash starts is recorded and forces a refresh
-     * after WiFi connects. */
-    maybe_show_splash(reset_reason);
+    /* Cold-boot splash: only when we have creds (otherwise the portal
+     * splash will be shown next). A long-press during cold boot still
+     * wins later; a tap before the splash starts is recorded and
+     * forces a refresh after WiFi connects. */
+    bool have_creds = wifi_creds_present();
+    maybe_show_splash(reset_reason, have_creds);
 
-    if (!wifi_creds_present()) {
+    if (!have_creds) {
         run_provisioning_then_reboot();
         return;
     }
