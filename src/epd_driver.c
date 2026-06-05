@@ -152,16 +152,40 @@ static void send_cmd(uint8_t cmd) {
 
 /* Stream the frame buffer in DATA_CHUNK_SIZE-byte chunks, each in its
  * own CS window, with the source bytes routed through a stack-local
- * buffer so the SPI DMA never reads directly from PSRAM. */
+ * buffer so the SPI DMA never reads directly from PSRAM.
+ *
+ * Rotates the frame 180 degrees as it streams: the panel is mounted in
+ * the PhotoPainter case 180 degrees from natural reading orientation
+ * (front of case = bottom of the panel chip's address space), so a
+ * frame composed top-left-first in source bytes would paint upside
+ * down without this. The rotation is two transformations applied to
+ * every byte:
+ *
+ *   - panel byte i is pulled from source byte (total - 1 - i)
+ *     (reverses both row order and column-pair order in one shot,
+ *     because the buffer is a flat scanline-major array).
+ *   - each byte's high and low nibbles are swapped, which flips the
+ *     two pixels packed inside that byte horizontally.
+ *
+ * Combined, that's a true 180 degree rotation. Cost is one byte read
+ * + one byte write per output byte during the chunk copy -- effectively
+ * free relative to the SPI clocking. */
 static void send_buffer(const uint8_t *frame, size_t len) {
     uint8_t local[DATA_CHUNK_SIZE];
 
-    ESP_LOGI(TAG, "Sending %u bytes in %u-byte chunks",
+    ESP_LOGI(TAG, "Sending %u bytes in %u-byte chunks (rotated 180)",
              (unsigned) len, (unsigned) DATA_CHUNK_SIZE);
+
+    /* Walk the source buffer from its end backwards, one chunk at a time. */
+    const uint8_t *src_end = frame + len;
 
     while (len > 0) {
         size_t chunk = (len > DATA_CHUNK_SIZE) ? DATA_CHUNK_SIZE : len;
-        memcpy(local, frame, chunk);
+        const uint8_t *src = src_end - chunk;
+        for (size_t i = 0; i < chunk; i++) {
+            uint8_t b = src[chunk - 1 - i];
+            local[i] = (uint8_t)((b << 4) | (b >> 4));
+        }
 
         gpio_set_level(EPD_PIN_DC, 1);
         spi_device_acquire_bus(s_spi, portMAX_DELAY);
@@ -170,8 +194,8 @@ static void send_buffer(const uint8_t *frame, size_t len) {
         gpio_set_level(EPD_PIN_CS, 1);
         spi_device_release_bus(s_spi);
 
-        frame += chunk;
-        len   -= chunk;
+        src_end -= chunk;
+        len     -= chunk;
     }
     ESP_LOGI(TAG, "Buffer send complete");
 }
