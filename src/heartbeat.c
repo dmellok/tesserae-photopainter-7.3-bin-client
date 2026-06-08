@@ -45,7 +45,8 @@ static const char *wake_reason_str(esp_reset_reason_t r) {
 
 void heartbeat_format_json(char *dst, size_t dst_sz,
                            int sleep_interval_s,
-                           esp_reset_reason_t reset_reason) {
+                           esp_reset_reason_t reset_reason,
+                           time_t sleep_until) {
     if (!dst || dst_sz == 0) return;
 
     int mv  = pmic_battery_mv();
@@ -57,20 +58,41 @@ void heartbeat_format_json(char *dst, size_t dst_sz,
     const char *wake = wake_reason_str(reset_reason);
 
     ESP_LOGI(TAG, "battery=%d mV (%d%%), rssi=%d dBm, ip=%s, fw=%s, "
-                  "sleep=%ds, wake=%s, kind=%s panel=%dx%d",
+                  "sleep=%ds, wake=%s, sleep_until=%lld",
              mv, pct, rssi, ip, FW_VERSION, sleep_interval_s, wake,
-             DEVICE_KIND, EPD_WIDTH, EPD_HEIGHT);
+             (long long) sleep_until);
 
-    /* kind/panel_w/panel_h let Tesserae pre-fill the Register form for a
-     * discovered device. sleep_interval_s + wake_reason let it (a) reason
-     * about expected vs actual heartbeat cadence rather than treating every
-     * sleep as a fault, and (b) spot brownouts / panics / wdt-resets that
-     * only manifest on battery. */
-    snprintf(dst, dst_sz,
+    /* Base payload: all unconditional fields. next_sleep_s mirrors
+     * sleep_interval_s for this firmware (we always sleep for the
+     * configured interval); the two keys exist because Tesserae's
+     * smart-sync wire contract distinguishes "configured cadence" from
+     * "actual upcoming sleep" -- firmwares that dynamically extend
+     * sleep on low battery could publish different values. */
+    int n = snprintf(dst, dst_sz,
              "{\"battery_mv\":%d,\"battery_pct\":%d,\"rssi\":%d,"
              "\"ip\":\"%s\",\"fw_version\":\"%s\","
              "\"kind\":\"%s\",\"panel_w\":%d,\"panel_h\":%d,"
-             "\"sleep_interval_s\":%d,\"wake_reason\":\"%s\"}",
+             "\"sleep_interval_s\":%d,\"next_sleep_s\":%d,"
+             "\"wake_reason\":\"%s\"",
              mv, pct, rssi, ip, FW_VERSION, DEVICE_KIND,
-             EPD_WIDTH, EPD_HEIGHT, sleep_interval_s, wake);
+             EPD_WIDTH, EPD_HEIGHT, sleep_interval_s, sleep_interval_s,
+             wake);
+
+    if (n < 0 || (size_t) n >= dst_sz) return;   /* truncated; leave as-is */
+
+    /* sleep_until is optional -- omit when NTP isn't synced so the
+     * server falls back to its tolerance-window math instead of seeing
+     * 0/garbage as a wall-clock timestamp. */
+    if (sleep_until > 0) {
+        int m = snprintf(dst + n, dst_sz - n,
+                         ",\"sleep_until\":%lld", (long long) sleep_until);
+        if (m > 0 && (size_t)(n + m) < dst_sz) n += m;
+    }
+
+    if ((size_t) n < dst_sz - 1) {
+        dst[n]     = '}';
+        dst[n + 1] = '\0';
+    } else if (dst_sz > 0) {
+        dst[dst_sz - 1] = '\0';
+    }
 }

@@ -15,6 +15,7 @@ static const char *TAG = "mqtt";
 
 #define BIT_GOT_MSG  BIT0
 #define BIT_FAILED   BIT1
+#define BIT_PUB_DONE BIT2
 
 typedef struct {
     EventGroupHandle_t events;
@@ -22,8 +23,15 @@ typedef struct {
     const char *update_topic;
     const char *config_topic;
     const char *status_topic;
-    const char *heartbeat_json;     /* may be NULL or empty */
 } ctx_t;
+
+typedef struct {
+    EventGroupHandle_t events;
+    const char *status_topic;
+    const char *payload;
+    int payload_len;
+    int msg_id;
+} pub_ctx_t;
 
 /* Per-device topics, derived from mqtt_config_t.device_id once per session.
  * Static so the pointers handed to esp-mqtt outlive the call. */
@@ -152,14 +160,6 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                  ctx->update_topic, ctx->config_topic);
         esp_mqtt_client_subscribe(e->client, ctx->update_topic, 1);
         esp_mqtt_client_subscribe(e->client, ctx->config_topic, 1);
-        if (ctx->heartbeat_json && ctx->heartbeat_json[0]) {
-            int len = strlen(ctx->heartbeat_json);
-            ESP_LOGI(TAG, "publishing heartbeat to %s (%d bytes)",
-                     ctx->status_topic, len);
-            esp_mqtt_client_publish(e->client, ctx->status_topic,
-                                    ctx->heartbeat_json, len,
-                                    /* qos */ 1, /* retain */ 1);
-        }
         break;
 
     case MQTT_EVENT_DATA:
@@ -192,7 +192,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 /* ---------- public API ---------- */
 
-esp_err_t mqtt_fetch_retained(mqtt_job_t *job, const char *heartbeat_json)
+esp_err_t mqtt_fetch_retained(mqtt_job_t *job)
 {
     if (!job) return ESP_ERR_INVALID_ARG;
     memset(job, 0, sizeof(*job));
@@ -207,7 +207,6 @@ esp_err_t mqtt_fetch_retained(mqtt_job_t *job, const char *heartbeat_json)
         .update_topic = s_update_topic,
         .config_topic = s_config_topic,
         .status_topic = s_status_topic,
-        .heartbeat_json = heartbeat_json,
     };
 
     /* LWT: a NON-retained will. The broker delivers it to any live subscriber
@@ -268,5 +267,113 @@ esp_err_t mqtt_fetch_retained(mqtt_job_t *job, const char *heartbeat_json)
 
     if (bits & BIT_GOT_MSG) return ESP_OK;
     if (bits & BIT_FAILED)  return ESP_FAIL;
+    return ESP_ERR_TIMEOUT;
+}
+
+/* ---------- one-shot heartbeat publish ---------- */
+
+/* Standalone PUBACK-confirming event handler used only by
+ * mqtt_publish_status. Publishes on CONNECTED, signals BIT_PUB_DONE
+ * when the broker acks the matching msg_id, BIT_FAILED on transport
+ * error. */
+static void on_pub_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    pub_ctx_t *ctx = arg;
+    esp_mqtt_event_handle_t e = data;
+
+    switch ((esp_mqtt_event_id_t)id) {
+    case MQTT_EVENT_CONNECTED:
+        ctx->msg_id = esp_mqtt_client_publish(
+            e->client, ctx->status_topic,
+            ctx->payload, ctx->payload_len,
+            /* qos */ 1, /* retain */ 1);
+        if (ctx->msg_id < 0) {
+            ESP_LOGE(TAG, "publish enqueue failed");
+            xEventGroupSetBits(ctx->events, BIT_FAILED);
+        } else {
+            ESP_LOGI(TAG, "publishing heartbeat to %s (%d bytes, msg_id=%d)",
+                     ctx->status_topic, ctx->payload_len, ctx->msg_id);
+        }
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        if (e->msg_id == ctx->msg_id) {
+            xEventGroupSetBits(ctx->events, BIT_PUB_DONE);
+        }
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "mqtt error during publish");
+        xEventGroupSetBits(ctx->events, BIT_FAILED);
+        break;
+
+    default:
+        break;
+    }
+}
+
+esp_err_t mqtt_publish_status(const char *payload)
+{
+    if (!payload || !*payload) return ESP_ERR_INVALID_ARG;
+
+    mqtt_config_t cfg_nvs;
+    mqtt_config_load(&cfg_nvs);
+    build_topics(cfg_nvs.device_id);
+
+    pub_ctx_t ctx = {
+        .events       = xEventGroupCreate(),
+        .status_topic = s_status_topic,
+        .payload      = payload,
+        .payload_len  = (int)strlen(payload),
+        .msg_id       = -1,
+    };
+
+    /* Same LWT contract as the fetch path: NON-retained will so the
+     * broker delivers offline to live subscribers without ever over-
+     * writing the retained heartbeat. Short keepalive -- this is a
+     * few-second session. */
+    static const char k_lwt_payload[] = "{\"state\":\"offline\"}";
+
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = cfg_nvs.uri,
+        .credentials.client_id = MQTT_CLIENT_ID,
+        .session.keepalive = 10,
+        .session.last_will = {
+            .topic   = s_status_topic,
+            .msg     = k_lwt_payload,
+            .msg_len = sizeof(k_lwt_payload) - 1,
+            .qos     = 1,
+            .retain  = 0,
+        },
+    };
+    if (cfg_nvs.user[0]) {
+        cfg.credentials.username = cfg_nvs.user;
+        cfg.credentials.authentication.password = cfg_nvs.pass;
+    }
+
+    esp_mqtt_client_handle_t cli = esp_mqtt_client_init(&cfg);
+    if (!cli) { vEventGroupDelete(ctx.events); return ESP_FAIL; }
+
+    esp_mqtt_client_register_event(cli, ESP_EVENT_ANY_ID, on_pub_event, &ctx);
+    esp_err_t err = esp_mqtt_client_start(cli);
+    if (err != ESP_OK) {
+        esp_mqtt_client_destroy(cli);
+        vEventGroupDelete(ctx.events);
+        return err;
+    }
+
+    /* Connect + publish + PUBACK normally finishes in <500 ms; 5 s
+     * gives generous room for slow brokers without bloating render-wake
+     * length. */
+    EventBits_t bits = xEventGroupWaitBits(
+        ctx.events, BIT_PUB_DONE | BIT_FAILED,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+
+    esp_mqtt_client_stop(cli);
+    esp_mqtt_client_destroy(cli);
+    vEventGroupDelete(ctx.events);
+
+    if (bits & BIT_PUB_DONE) return ESP_OK;
+    if (bits & BIT_FAILED)   return ESP_FAIL;
     return ESP_ERR_TIMEOUT;
 }

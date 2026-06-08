@@ -1,5 +1,5 @@
 /*
- * Single-shot MQTT job grabber.
+ * Single-shot MQTT job grabber + one-shot heartbeat publisher.
  *
  * Each wake-up:
  *   1. connects to the broker
@@ -25,8 +25,16 @@ typedef struct {
  * (job->url is non-empty), ESP_ERR_TIMEOUT if the broker had no retained
  * message, or another esp_err_t on transport failure.
  *
- * If `heartbeat_json` is non-NULL and non-empty, that string is published
- * retained to tesserae/<device_id>/status right after we connect, before
- * waiting for the update message -- so a dying device still reports its
- * state even if the render path later fails. */
-esp_err_t mqtt_fetch_retained(mqtt_job_t *job, const char *heartbeat_json);
+ * Does NOT publish the heartbeat -- that's a separate call
+ * (mqtt_publish_status below), invoked at the END of the wake so
+ * sleep_until is wall-clock-accurate for Tesserae's smart-sync
+ * scheduler. */
+esp_err_t mqtt_fetch_retained(mqtt_job_t *job);
+
+/* One-shot: bring up MQTT, publish `payload` retained QoS 1 to
+ * tesserae/<device_id>/status, wait for the broker PUBACK, tear down.
+ *
+ * The caller is expected to have WiFi up. Used at the END of every
+ * wake so the embedded next_sleep_s / sleep_until reflect the sleep
+ * about to start (per Tesserae's smart-sync wire contract). */
+esp_err_t mqtt_publish_status(const char *payload);
