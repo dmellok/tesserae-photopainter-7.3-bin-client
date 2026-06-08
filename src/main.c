@@ -250,12 +250,46 @@ static void run_provisioning_then_reboot(void) {
 
 /* ---------- wall-clock time + heartbeat ---------- */
 
-/* Lazy NTP sync. The RTC slow clock keeps running through deep sleep,
- * so the system time set by SNTP persists across wakes -- only a true
- * cold boot (RTC reset) actually has to hit pool.ntp.org. Any time()
- * value past 2023-01-01 indicates the RTC has a sensible epoch. */
-static void ensure_time_synced(int wait_ms) {
-    if (time(NULL) > 1700000000LL) return;
+/* Reasonable-epoch window for time(NULL):
+ *   MIN = 2023-11-14  -- catches the ESP-IDF default 2016 epoch when
+ *                        NTP has never synced (or before it does)
+ *   MAX = 2039-09-13  -- catches a misconfigured SNTP server returning
+ *                        a wild far-future date
+ * Outside this window we treat the clock as bogus and omit sleep_until
+ * rather than ship the bad value. */
+#define EPOCH_REASONABLE_MIN  1700000000LL
+#define EPOCH_REASONABLE_MAX  2200000000LL
+
+/* NTP sync helper.
+ *
+ * On most ESP32-S3 boards the RTC slow clock keeps running through
+ * deep sleep and the POSIX time advances naturally, so a cached-time
+ * skip would be cheap. Unfortunately on the PhotoPainter this does
+ * NOT hold: empirically `time(NULL)` reads ~26 s behind wall-clock on
+ * every timer-wake from deep sleep, almost certainly because the
+ * AXP2101 PMIC sleep state interferes with the SoC's RTC time-of-day
+ * maintenance. The bug is invisible until you cross-check the
+ * heartbeat's sleep_until against the broker-receive timestamp --
+ * Tesserae's smart-sync scheduler then marks the device "untrusted"
+ * because predicted-wake-time disagrees with observed-wake-time by
+ * tens of seconds.
+ *
+ * So this firmware does a fresh SNTP exchange on EVERY wake, not just
+ * on cold boot. The cost is +1-5 s of WiFi-on time per wake (~0.02-
+ * 0.11 mAh extra) but every published sleep_until is wall-clock-
+ * accurate. `force_resync` is retained as a parameter for symmetry
+ * with the sibling firmware's API and for forward compatibility -- a
+ * future PhotoPainter board with a 32 K crystal could re-enable the
+ * cached-time skip by checking !force_resync.
+ *
+ * 5 s timeout: 3 s was empirically too tight on residential WiFi for
+ * the cold-boot first lookup (DNS + NTP round-trip). 5 s reliably
+ * succeeds. */
+static void ensure_time_synced(int wait_ms, bool force_resync) {
+    (void) force_resync;   /* always re-syncs on this hardware */
+    time_t cached = time(NULL);
+    ESP_LOGI(TAG, "ntp sync (cached epoch=%lld, force=%d)",
+             (long long) cached, (int) force_resync);
 
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_err_t err = esp_netif_sntp_init(&cfg);
@@ -281,11 +315,39 @@ static void ensure_time_synced(int wait_ms) {
  * retained QoS 1, waits for the PUBACK, tears MQTT down. Failures are
  * logged and swallowed -- a missed heartbeat just means the server's
  * next prediction falls back to its tolerance-window math for one
- * cycle. */
+ * cycle.
+ *
+ * sleep_until guards (any of these tripping omits the key):
+ *   - clock not in [2023-11-14, 2039-09-13] -- NTP not synced or
+ *     server returned garbage
+ *   - cross-check delta = sleep_until - now outside [sleep_s-5,
+ *     sleep_s+5] -- tautological with `now + sleep_s` today, but a
+ *     future refactor that computes sleep_until via a different path
+ *     would be caught here, and the log warning is the easiest signal
+ *     to discover such a bug. */
 static void publish_heartbeat(int sleep_s, esp_reset_reason_t reset_reason) {
     char hb[320];
     time_t now = time(NULL);
-    time_t sleep_until = (now > 1700000000LL) ? (now + sleep_s) : 0;
+    time_t sleep_until = 0;
+
+    if (now > EPOCH_REASONABLE_MIN && now < EPOCH_REASONABLE_MAX) {
+        time_t candidate = now + sleep_s;
+        long delta = (long)(candidate - now);
+        if (delta < (long) sleep_s - 5 || delta > (long) sleep_s + 5) {
+            ESP_LOGW(TAG,
+                "sleep_until cross-check failed: delta=%ld, sleep_s=%d; omitting",
+                delta, sleep_s);
+        } else {
+            sleep_until = candidate;
+        }
+    } else if (now != 0) {
+        ESP_LOGW(TAG,
+            "epoch=%lld outside sane window [%lld, %lld]; omitting sleep_until",
+            (long long) now,
+            (long long) EPOCH_REASONABLE_MIN,
+            (long long) EPOCH_REASONABLE_MAX);
+    }
+
     heartbeat_format_json(hb, sizeof hb, sleep_s, reset_reason, sleep_until);
 
     esp_err_t err = mqtt_publish_status(hb);
@@ -370,14 +432,18 @@ void app_main(void) {
 
     int sleep_s = load_sleep_interval_s();
 
-    /* NTP carries across deep sleep via the RTC; only a true cold boot
-     * actually hits pool.ntp.org. 5 s window for the first sync (3 s
-     * proved too tight in practice -- DNS + NTP round-trip on a fresh
-     * cache can take 4+ s on residential WiFi). Cached wakes return
-     * instantly. If sync fails, sleep_until is omitted from the
-     * heartbeat and the server's smart-sync scheduler falls back to
-     * its tolerance-window math. */
-    ensure_time_synced(5000);
+    /* NTP carries across deep sleep via the RTC, so deep-sleep timer
+     * wakes return instantly with cached time. Cold boots (power-on /
+     * external reset) force a fresh exchange -- that's the recovery
+     * path for an NTP-poisoned RTC (e.g. a router intercepting UDP/123
+     * and returning a stale timestamp). 5 s window for the first sync
+     * is empirically enough on residential WiFi. If the exchange
+     * fails, sleep_until is omitted from the heartbeat and the
+     * server's smart-sync scheduler falls back to its tolerance
+     * window. */
+    bool cold_boot = (reset_reason == ESP_RST_POWERON ||
+                      reset_reason == ESP_RST_EXT);
+    ensure_time_synced(5000, cold_boot);
 
     /* Fetch the retained URL only -- the heartbeat publishes at the END
      * (after paint, if any) so its sleep_until reflects the actual sleep

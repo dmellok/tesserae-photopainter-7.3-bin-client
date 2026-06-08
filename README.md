@@ -92,27 +92,32 @@ The double-tap path relies on the AXP2101 preserving RTC slow-memory across a PE
 - **Panel power via PMIC** — `pmic_rails_set(false)` is what gets the average current down before deep sleep, since the PhotoPainter has no dedicated GPIO panel-power gate. All four ALDO rails get dropped together (the Waveshare schematic doesn't publish the per-ALDO mapping; this mirrors their factory firmware behaviour).
 - **Battery via I²C** — `pmic_battery_mv()` and `pmic_battery_pct()` come straight from the AXP2101 fuel gauge; no curve-fit ADC calibration, no Li-Po SoC table to maintain.
 
-### Smart-sync overhead (v0.2.0)
+### Smart-sync overhead
 
-Since v0.2.0 the heartbeat publishes at the **end** of every wake (so `sleep_until` is wall-clock-accurate). On render wakes this means a brief WiFi reconnect after the paint — measurable but small:
+Since v0.2.0 the heartbeat publishes at the **end** of every wake so `sleep_until` is wall-clock-accurate. Two PhotoPainter-specific quirks make this firmware's cost a bit higher than the sibling's:
+
+- **Always-resync NTP.** On the sibling, `time(NULL)` advances naturally across deep sleep and a cached SNTP sync is reused. On the PhotoPainter, empirically `time(NULL)` reads ~26 s behind wall-clock on every timer-wake from deep sleep — almost certainly because the AXP2101 PMIC sleep state interferes with the SoC's RTC time-of-day maintenance. So this firmware does a fresh SNTP exchange on **every** wake, not just cold boot. Without it, Tesserae's smart-sync scheduler would mark the device "untrusted" because predicted-wake-time would disagree with observed-wake-time by tens of seconds. See `ensure_time_synced` in [`src/main.c`](src/main.c) for the long comment.
+- **Render-wake WiFi reconnect.** On render wakes we drop WiFi before the ~25 s paint (single biggest battery saving) and reconnect afterwards to publish the heartbeat — costs ~3-5 s of WiFi-on time.
+
+Per-wake cost:
 
 | Wake type | Δ per wake |
 |---|---|
-| Hash-skip (URL unchanged) — most common in steady state | **0 mAh** (heartbeat shares the existing MQTT session, just publishes at the end) |
-| Render wake (new URL or BOOT tap) | **+0.07–0.11 mAh** (~3–5 s WiFi reconnect + one-shot MQTT publish at ~80 mA) |
-| First cold boot (NTP not yet cached) | **+0.11 mAh** one-time (5 s SNTP window; RTC carries the synced clock across deep sleep so subsequent wakes are instant) |
+| Hash-skip (URL unchanged) | **+0.02–0.07 mAh** (1-3 s NTP sync at ~80 mA; heartbeat shares the existing MQTT session) |
+| Render wake (new URL or BOOT tap) | **+0.10–0.18 mAh** (NTP sync + WiFi reconnect + one-shot MQTT publish) |
+| First wake after a flash/cold-boot | sometimes drops `sleep_until` if SNTP misses the 5 s window — the graceful-omit path. Subsequent wakes are clean. |
 
 Impact on the documented use cases (15-min default sleep interval, 96 wakes/day):
 
-| Use case | Render wakes/day | Pre-v0.2.0 daily draw | Post-v0.2.0 | Δ |
+| Use case | Render wakes/day | Pre-v0.2.0 daily draw | Post-v0.2.1 | Δ |
 |---|---|---|---|---|
-| Photo frame (1 update/day) | 1 | ~14 mAh | ~14.1 mAh | +0.8% |
-| Dashboard (hourly updates) | 24 | ~30 mAh | ~32.6 mAh | +9% |
-| Frequent (every wake renders) | 96 | ~75 mAh | ~85.6 mAh | +14% |
+| Photo frame (1 update/day) | 1 | ~14 mAh | ~18 mAh | +28% |
+| Dashboard (hourly updates) | 24 | ~30 mAh | ~37 mAh | +24% |
+| Frequent (every wake renders) | 96 | ~75 mAh | ~89 mAh | +19% |
 
-The alternative (keep WiFi up through the 25 s paint) would have cost ~2 mAh per render wake — **20× worse** than the reconnect approach. What you get for the overhead: Tesserae JIT-renders the next frame to land in the retained slot right before each wake, instead of pre-staging and risking staleness.
+Worth-it trade: the alternative (keep WiFi up through the 25 s paint, or skip smart-sync entirely) costs ~2 mAh per render wake — **20× worse** than what we ship. What you get for the overhead: Tesserae JIT-renders the next frame to land in the retained slot right before each wake, instead of pre-staging and risking staleness.
 
-If a high-frequency deployment ever finds the cost unacceptable, the heartbeat path is the natural place to add an "every Nth wake" gate — the server tolerates absent heartbeats within its window.
+If a deployment ever finds the always-resync NTP cost unacceptable, the natural fix is a future PhotoPainter hardware revision with a 32 K crystal on the RTC slow clock — the `force_resync` parameter is already plumbed for that case (set `!force_resync` to re-enable the cached-time skip).
 
 ## Project layout
 
